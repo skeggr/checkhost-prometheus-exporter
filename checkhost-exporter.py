@@ -16,7 +16,7 @@ registry = CollectorRegistry()
 g_metric = Gauge('request_time', f'Request time to {CHECK_DOMAIN}', ('from', 'to'), registry=registry)
 
 
-class HttpCheck():
+class Check:
     def __init__(self, response):
         self.req_id = response['request_id']
         self.nodes_dict = {}
@@ -24,26 +24,35 @@ class HttpCheck():
             self.nodes_dict[k] = {}
             _, self.nodes_dict[k]['country'], self.nodes_dict[k]['city'], _, _ = v
 
-    def fill_node_props(self, json_data):
-        for k, v in json_data.items():
+
+class HttpCheck(Check):
+    def parse_check_result(self, data):
+        for k, v in data.items():
             # check if node succesfully checks domain
-            if v[0][0] == 1:
+            if v[0] and (v[0][0] == 1):
                 _, self.nodes_dict[k]['response_time'], _, _, _ = v[0]
             else:
                 self.nodes_dict[k]['response_time'] = 0
 
 
-def generate_response(check_type, nodes_count):
+class PingCheck(Check):
+    @staticmethod
+    def calc_avg_ping_time(pings):
+        return (elem[1] for elem in pings if elem[0] == 'OK')
+
+    def parse_check_result(self, data):
+        for k, v in data.items():
+            self.nodes_dict[k]['ping_results'] = v[0]
+            timings = (elem[1] for elem in v[0] if elem[0] == 'OK')
+            self.nodes_dict[k]['avg_time'] = sum(timings)/len(v[0])
+
+
+def run_check(check_type, nodes_count):
     uri = "https://check-host.net/check-{}?host=https://{}&max_nodes={}".format(check_type,
                                                                                 CHECK_DOMAIN,
                                                                                 nodes_count)
     api_response = api_request(uri)
-    opts = {
-            'http': http_check_resp_parse,
-            'ping': ping_check_resp_parse
-    }
-    check_result = opts[check_type](api_response)
-    return check_result
+    return check_result_handler(api_response, check_type)
 
 
 def api_request(uri, try_num=1):
@@ -70,16 +79,20 @@ def api_request(uri, try_num=1):
             exit(1)
 
 
-def http_check_resp_parse(res):
+def check_result_handler(res, check_type):
     try:
-        check = HttpCheck(res)
+        opts = {
+            'http': HttpCheck,
+            'ping': PingCheck
+        }
+        check = opts[check_type](res)
         uri = "https://check-host.net/check-result/{}".format(check.req_id)
-        get_resp = api_request(uri)
-        while None in get_resp.values():
+        resp = api_request(uri)
+        while None in resp.values():
             logger.debug('Not complete result ("None" in values), trying one more time')
             time.sleep(3)
-            get_resp = api_request(uri)
-        check.fill_node_props(get_resp)
+            resp = api_request(uri)
+        check.parse_check_result(resp)
         return check
     except KeyError:
         if 'limit_exceeded' in res.values():
@@ -104,10 +117,6 @@ def set_logger(name):
     return lg
 
 
-def ping_check_resp_parse():
-    pass
-
-
 if __name__ == "__main__":
     logger = set_logger('checkhost-exporter')
     if not CHECK_DOMAIN:
@@ -115,7 +124,7 @@ if __name__ == "__main__":
         exit(1)
     start_http_server(EXPORTER_PORT, registry=registry)
     while True:
-        gen_metric(generate_response('http', NODES_COUNT))
+        gen_metric(run_check('http', NODES_COUNT))
         time.sleep(30)
 
 
